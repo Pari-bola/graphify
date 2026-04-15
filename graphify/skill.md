@@ -388,6 +388,181 @@ print(f'Merged: {total} nodes, {edges} edges ({len(ast[\"nodes\"])} AST + {len(s
 "
 ```
 
+### Step 3.5 - Cross-file reference linking (deterministic)
+
+Subagents in Step 3 only see their own chunk of files. Cross-file references (a skill mentioning another skill, a principles file referencing a domain) are structurally invisible to them. This step adds deterministic INFERRED edges by scanning source file content for references to other files in the corpus.
+
+This is always-on, costs zero tokens (no LLM), and typically adds 50-300 edges depending on corpus cross-referencing density.
+
+```bash
+$(cat .graphify_python) << 'LINKEOF'
+import json, re
+from pathlib import Path
+from collections import defaultdict
+import networkx as nx
+
+extract = json.loads(Path('.graphify_extract.json').read_text(encoding='utf-8'))
+
+# Index nodes by source file (normalize paths for cross-platform consistency)
+file_nodes = defaultdict(list)
+for n in extract['nodes']:
+    sf = n.get('source_file', '')
+    if sf:
+        sf_norm = str(Path(sf))
+        n['source_file'] = sf_norm
+        file_nodes[sf_norm].append(n)
+
+# Build existing edge set for dedup
+existing = set()
+for e in extract['edges']:
+    existing.add((e['source'], e['target']))
+    existing.add((e['target'], e['source']))
+
+# Generate a "signature" for each file — the distinctive name other files
+# would use to reference it. SKILL.md/README.md use parent dir name.
+STOP_WORDS = {
+    'domains', 'analysis', 'decisions', 'references', 'solutions', 'memory',
+    'skills', 'commands', 'learnings', 'data', 'docs', 'tools', 'converted',
+    'working-drafts', 'session-briefs', 'integration-issues', 'plugins',
+    'graphify-out', 'project-skills', 'pending', 'readme', 'index',
+    'principles', 'overview', 'imports', 'tests', 'test', 'src', 'lib',
+    'utils', 'config', 'output', 'build', 'dist', 'node_modules',
+}
+
+def get_file_signature(sf):
+    p = Path(sf)
+    stem = p.stem.lower()
+    if stem in ('skill', 'readme', 'index'):
+        return p.parent.name.lower()
+    return stem
+
+file_sigs = {}
+for sf in file_nodes:
+    sig = get_file_signature(sf)
+    if sig in STOP_WORDS or len(sig) < 6:
+        continue
+    file_sigs[sf] = sig
+
+# Pre-compute word-boundary patterns and variants for each signature
+sig_variants = {}
+for sf, sig in file_sigs.items():
+    variants = list({sig, sig.replace('-', ' '), sig.replace('_', ' ')})
+    patterns = [re.compile(r'\b' + re.escape(v) + r'\b') for v in variants]
+    sig_variants[sf] = patterns
+
+# Read all source files. In one pass: count mentions (for TF filtering)
+# and record which (src_file, tgt_file) pairs matched (to avoid re-scanning).
+file_contents = {}
+sig_mention_count = defaultdict(int)
+matches = defaultdict(set)  # src_file -> set of tgt_files that matched
+
+for sf in file_nodes:
+    p = Path(sf)
+    if not p.exists():
+        continue
+    try:
+        content = p.read_text(encoding='utf-8', errors='ignore').lower()
+        file_contents[sf] = content
+    except (OSError, UnicodeDecodeError):
+        continue
+
+for sf, content in file_contents.items():
+    for tgt_sf, patterns in sig_variants.items():
+        if tgt_sf == sf:
+            continue
+        if any(p.search(content) for p in patterns):
+            sig_mention_count[file_sigs[tgt_sf]] += 1
+            matches[sf].add(tgt_sf)
+
+max_mentions = int(max(len(file_contents) * 0.3, 5))
+distinctive = {sf for sf, sig in file_sigs.items()
+               if sig_mention_count.get(sig, 0) <= max_mentions}
+
+# Create cross-file edges using pre-recorded matches (no re-scanning).
+new_edges = []
+for src_file, tgt_files in matches.items():
+    for tgt_file in tgt_files:
+        if tgt_file not in distinctive:
+            continue
+        src_node = file_nodes[src_file][0]['id']
+        tgt_node = file_nodes[tgt_file][0]['id']
+        if (src_node, tgt_node) not in existing:
+            new_edges.append({
+                'source': src_node,
+                'target': tgt_node,
+                'relation': 'cross_reference',
+                'confidence': 'INFERRED',
+                'confidence_score': 0.7,
+                'source_file': src_file,
+                'source_location': None,
+                'weight': 0.7,
+            })
+            existing.add((src_node, tgt_node))
+            existing.add((tgt_node, src_node))
+
+extract['edges'].extend(new_edges)
+
+dropped = len(file_sigs) - len(distinctive)
+print(f'Cross-file linking: {len(new_edges)} edges added '
+      f'({len(distinctive)} file signatures used, {dropped} dropped as too common)')
+
+# --- Pass 2: Same-file component merge ---
+# The extractor sometimes produces multiple disconnected clusters from a
+# single source file. These land in separate connected components, making
+# the graph look more fragmented than the content warrants. Fix: for each
+# source file whose nodes span multiple components, add an edge between
+# the clusters so they merge into one component.
+# Note: G_temp includes Pass 1's cross-file edges — ordering matters.
+G_temp = nx.Graph()
+for n in extract['nodes']:
+    G_temp.add_node(n['id'])
+for e in extract['edges']:
+    G_temp.add_edge(e['source'], e['target'])
+
+node_to_comp = {}
+for i, comp in enumerate(nx.connected_components(G_temp)):
+    for n in comp:
+        node_to_comp[n] = i
+
+merge_edges = []
+for sf, sf_nodes in file_nodes.items():
+    if len(sf_nodes) <= 1:
+        continue
+    comps_in_file = defaultdict(list)
+    for n in sf_nodes:
+        comps_in_file[node_to_comp[n['id']]].append(n['id'])
+
+    if len(comps_in_file) <= 1:
+        continue
+
+    # Connect each fragment to the largest fragment via its first node
+    sorted_comps = sorted(comps_in_file.items(), key=lambda x: -len(x[1]))
+    main_node = sorted_comps[0][1][0]
+    for _, frag_nodes in sorted_comps[1:]:
+        frag_node = frag_nodes[0]
+        if (main_node, frag_node) not in existing:
+            merge_edges.append({
+                'source': main_node,
+                'target': frag_node,
+                'relation': 'same_source',
+                'confidence': 'INFERRED',
+                'confidence_score': 0.9,
+                'source_file': sf,
+                'source_location': None,
+                'weight': 0.9,
+            })
+            existing.add((main_node, frag_node))
+            existing.add((frag_node, main_node))
+
+extract['edges'].extend(merge_edges)
+print(f'Same-file merge: {len(merge_edges)} edges added (bridging fragmented files)')
+
+Path('.graphify_extract.json').write_text(json.dumps(extract, indent=2, ensure_ascii=False),
+                                          encoding='utf-8')
+print(f'Step 3.5 total: {len(new_edges) + len(merge_edges)} edges added to extraction')
+LINKEOF
+```
+
 ### Step 4 - Build graph, cluster, analyze, generate outputs
 
 **Before starting:** note whether `--directed` was given. If so, pass `directed=True` to `build_from_json()` in the code block below. This builds a `DiGraph` that preserves edge direction (source→target) instead of the default undirected `Graph`.
